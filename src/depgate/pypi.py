@@ -85,6 +85,21 @@ class Project:
         return sum(1 for r in self.releases.values() if r.files)
 
 
+@dataclass
+class Vulnerability:
+    id: str
+    aliases: list[str]
+    summary: str
+    fixed_in: list[str]
+    withdrawn: bool = False
+
+
+@dataclass
+class ReleaseDetail:
+    digests: dict[str, str]  # filename -> sha256
+    vulnerabilities: list[Vulnerability]
+
+
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -130,6 +145,28 @@ class PyPIClient:
             project_urls=info.get("project_urls") or {},
             releases=releases,
         )
+
+    def release_detail(self, name: str, version: str) -> "ReleaseDetail | None":
+        """Per-version data: file digests and known vulnerabilities (PyPI sources these from OSV)."""
+        status, data = self._get(f"{self.base}/pypi/{normalize(name)}/{version}/json")
+        if status != 200 or data is None:
+            return None
+        digests = {
+            u["filename"]: (u.get("digests") or {}).get("sha256", "")
+            for u in data.get("urls") or []
+        }
+        vulns = [
+            Vulnerability(
+                id=v.get("id", "unknown"),
+                aliases=list(v.get("aliases") or []),
+                summary=(v.get("summary") or v.get("details") or "").strip().splitlines()[0][:160]
+                if (v.get("summary") or v.get("details")) else "",
+                fixed_in=list(v.get("fixed_in") or []),
+                withdrawn=bool(v.get("withdrawn")),
+            )
+            for v in data.get("vulnerabilities") or []
+        ]
+        return ReleaseDetail(digests=digests, vulnerabilities=[v for v in vulns if not v.withdrawn])
 
     def provenance(self, name: str, version: str, filename: str) -> dict | None:
         url = f"{self.base}/integrity/{normalize(name)}/{version}/{filename}/provenance"

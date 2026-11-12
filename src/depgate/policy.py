@@ -43,6 +43,15 @@ class Policy:
     established_age_days: int = 730
     established_min_releases: int = 10
 
+    # Attestations exist but fail cryptographic verification.
+    attestation_invalid_action: str = "block"
+
+    # Verified publisher repo differs from the source repo the project advertises.
+    publisher_mismatch_action: str = "flag"
+
+    # This version has known, non-withdrawn vulnerabilities (per PyPI / OSV).
+    vuln_action: str = "flag"
+
     # Project has no source/homepage URL in its metadata.
     no_source_url_action: str = "info"
 
@@ -63,6 +72,7 @@ AGENT = replace(
     sdist_only_action="flag",
     no_provenance_action="flag",
     no_source_url_action="flag",
+    vuln_action="block",
 )
 
 PROFILES = {"default": DEFAULT, "agent": AGENT}

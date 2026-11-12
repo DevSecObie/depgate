@@ -3,8 +3,10 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from depgate import verify as verify_mod
 from depgate.checks import ALLOW, BLOCK, FLAG, evaluate, lookalikes
 from depgate.cli import parse_spec
+from depgate.hook import parse_install_command, read_hook_command
 from depgate.policy import AGENT, DEFAULT
 from depgate.popular import POPULAR_SET
 from depgate.pypi import PyPIClient
@@ -41,21 +43,48 @@ def project(name, releases, urls=None):
 
 
 class FakePyPI:
-    def __init__(self, projects=None, attested=None):
+    def __init__(self, projects=None, attested=None, vulns=None, publisher_repo="x/y"):
         self.projects = projects or {}
         self.attested = attested or set()  # filenames with provenance
+        self.vulns = vulns or {}           # (name, version) -> list of vuln dicts
+        self.publisher_repo = publisher_repo
 
     def __call__(self, url):
         if "/integrity/" in url:
             fname = url.rstrip("/").split("/")[-2]
             if fname in self.attested:
                 return 200, {"attestation_bundles": [
-                    {"publisher": {"kind": "GitHub", "repository": "org/repo"}}]}
+                    {"publisher": {"kind": "GitHub", "repository": self.publisher_repo}}]}
             return 404, None
-        name = url.split("/pypi/")[1].split("/")[0]
-        if name in self.projects:
-            return 200, self.projects[name]
-        return 404, None
+        parts = url.split("/pypi/")[1].split("/")
+        name = parts[0]
+        if name not in self.projects:
+            return 404, None
+        if len(parts) == 3:  # /pypi/<name>/<version>/json
+            version = parts[1]
+            files = self.projects[name]["releases"].get(version, [])
+            return 200, {
+                "urls": [{"filename": f["filename"], "digests": {"sha256": "ab" * 32}} for f in files],
+                "vulnerabilities": self.vulns.get((name, version), []),
+            }
+        return 200, self.projects[name]
+
+
+# Stand-in for real Sigstore verification so tests run offline and deterministically.
+TAMPERED: set[str] = set()
+
+
+def fake_verify(filename, sha256, provenance, state):
+    pub = provenance["attestation_bundles"][0]["publisher"]
+    desc = verify_mod.describe_publisher(pub)
+    if filename in TAMPERED:
+        return [verify_mod.FileResult(filename, False, desc, error="VerificationError: digest mismatch")]
+    return [verify_mod.FileResult(filename, True, desc)]
+
+
+def setUpModule():
+    verify_mod.AVAILABLE = True
+    verify_mod.verify_provenance = fake_verify
 
 
 def run(fake, name, version=None, agent=False):
@@ -151,6 +180,79 @@ class TestSpecParsing(unittest.TestCase):
         self.assertEqual(parse_spec("requests"), ("requests", None))
         self.assertEqual(parse_spec("uvicorn[standard]==0.30.0"), ("uvicorn", "0.30.0"))
         self.assertEqual(parse_spec("flask>=3.0"), ("flask", None))
+
+
+class TestVerificationAndVulns(unittest.TestCase):
+    def tearDown(self):
+        TAMPERED.clear()
+
+    def test_verified_attestation_allows(self):
+        fake = FakePyPI({"goodpkg": MATURE}, attested={"goodpkg-2.0.whl"})
+        d = run(fake, "goodpkg")  # agent mode would flag the short release history
+        self.assertEqual(d.verdict, ALLOW)
+        self.assertIn("verified", " ".join(f.message for f in d.findings))
+
+    def test_failed_verification_blocks(self):
+        TAMPERED.add("goodpkg-2.0.whl")
+        fake = FakePyPI({"goodpkg": MATURE}, attested={"goodpkg-2.0.whl"})
+        self.assertEqual(run(fake, "goodpkg").verdict, BLOCK)
+
+    def test_publisher_from_other_owner_flags(self):
+        fake = FakePyPI({"goodpkg": MATURE}, attested={"goodpkg-2.0.whl"}, publisher_repo="attacker/y")
+        d = run(fake, "goodpkg")
+        self.assertEqual(d.verdict, FLAG)
+        self.assertIn("different owner", " ".join(f.message for f in d.findings))
+
+    def test_publisher_same_org_other_repo_is_info(self):
+        fake = FakePyPI({"goodpkg": MATURE}, attested={"goodpkg-2.0.whl"}, publisher_repo="x/y-release")
+        self.assertEqual(run(fake, "goodpkg").verdict, ALLOW)
+
+    def test_vulnerabilities_flag_or_block_and_dedupe(self):
+        vulns = {("goodpkg", "2.0"): [
+            {"id": "PYSEC-1", "aliases": ["CVE-2026-0001"], "fixed_in": ["2.1"]},
+            {"id": "GHSA-aaaa", "aliases": ["CVE-2026-0001"], "fixed_in": ["2.1"]},
+            {"id": "PYSEC-2", "aliases": [], "fixed_in": [], "withdrawn": "2026-01-01"},
+        ]}
+        fake = FakePyPI({"goodpkg": MATURE}, attested={"goodpkg-2.0.whl"}, vulns=vulns)
+        d = run(fake, "goodpkg")
+        self.assertEqual(d.verdict, FLAG)
+        msg = [f.message for f in d.findings if f.check == "vulnerabilities"][0]
+        self.assertTrue(msg.startswith("1 known"))  # duplicate collapsed, withdrawn dropped
+        self.assertEqual(run(fake, "goodpkg", agent=True).verdict, BLOCK)
+
+
+class TestInstallCommandParsing(unittest.TestCase):
+    def specs(self, cmd):
+        return [t.spec for t in parse_install_command(cmd) if t.spec]
+
+    def test_common_installers(self):
+        self.assertEqual(self.specs("pip install requests flask==3.0"), ["requests", "flask==3.0"])
+        self.assertEqual(self.specs("python3.12 -m pip install -U --user rich"), ["rich"])
+        self.assertEqual(self.specs("uv add httpx"), ["httpx"])
+        self.assertEqual(self.specs("uv pip install pydantic"), ["pydantic"])
+        self.assertEqual(self.specs("poetry add numpy"), ["numpy"])
+        self.assertEqual(self.specs("sudo /usr/bin/pip3 install boto3"), ["boto3"])
+
+    def test_chained_commands(self):
+        self.assertEqual(self.specs("cd app && pip install a; echo done || pip install b"), ["a", "b"])
+
+    def test_ignores_non_installs(self):
+        self.assertEqual(parse_install_command("pip list && pip show requests && ls"), [])
+
+    def test_special_sources(self):
+        t = parse_install_command("pip install -r reqs.txt -i https://mirror/simple git+https://x/y.git ./local")
+        self.assertEqual(t[0].requirements, "reqs.txt")
+        self.assertEqual(t[1].custom_index, "https://mirror/simple")
+        self.assertEqual([x.direct_source for x in t[2:]], ["git+https://x/y.git", "./local"])
+
+    def test_option_values_are_not_packages(self):
+        self.assertEqual(self.specs("pip install --target /tmp/x -c constraints.txt six"), ["six"])
+
+    def test_hook_event_reading(self):
+        self.assertEqual(read_hook_command('{"tool_name":"Bash","tool_input":{"command":"pip install x"}}'),
+                         "pip install x")
+        self.assertIsNone(read_hook_command('{"tool_name":"Edit","tool_input":{}}'))
+        self.assertIsNone(read_hook_command("not json"))
 
 
 if __name__ == "__main__":

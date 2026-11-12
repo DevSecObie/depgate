@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import verify as verify_mod
 from .policy import Policy
 from .popular import POPULAR_SET
 from .pypi import Project, PyPIClient, Release, normalize
@@ -105,6 +107,20 @@ def _action(level: str) -> str | None:
     return None if level == "allow" else level
 
 
+_GH_REPO = re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.I)
+
+
+def _source_repos(project_urls: dict[str, str]) -> set[str]:
+    """GitHub owner/repo pairs the project advertises in its metadata."""
+    repos = set()
+    for url in project_urls.values():
+        m = _GH_REPO.search(url or "")
+        if m:
+            repo = m.group(2).removesuffix(".git")
+            repos.add(f"{m.group(1)}/{repo}".lower())
+    return repos
+
+
 # ---------- main entry ----------
 
 def evaluate(
@@ -114,6 +130,7 @@ def evaluate(
     policy: Policy,
     profile: str = "default",
     now: datetime | None = None,
+    verify: bool = True,
 ) -> Decision:
     now = now or datetime.now(timezone.utc)
     decision = Decision(package=name, version=version, profile=profile)
@@ -179,19 +196,74 @@ def evaluate(
             add(Finding("install-code", level,
                         "No wheel for this version; installing builds from source and runs the package's build code."))
 
-    # 7. Provenance (PyPI attestations / Trusted Publishing)
-    publishers = set()
+    detail = client.release_detail(project.name, target_version)
+
+    # 7. Known vulnerabilities (PyPI's per-version data, sourced from OSV)
+    if detail and detail.vulnerabilities:
+        # PyPI lists PYSEC and GHSA advisories separately; collapse ones sharing an ID or alias.
+        unique, seen = [], set()
+        for v in detail.vulnerabilities:
+            keys = {v.id, *v.aliases}
+            if keys & seen:
+                continue
+            seen |= keys
+            unique.append(v)
+        parts = []
+        for v in unique[:5]:
+            cve = next((a for a in [v.id, *v.aliases] if a.startswith("CVE-")), v.id)
+            fixed = f" (fixed in {', '.join(v.fixed_in[:2])})" if v.fixed_in else ""
+            parts.append(f"{cve}{fixed}")
+        more = f", and {len(unique) - 5} more" if len(unique) > 5 else ""
+        add(Finding("vulnerabilities", policy.vuln_action,
+                    f"{len(unique)} known vulnerabilities: {', '.join(parts)}{more}."))
+
+    # 8. Provenance (PEP 740 attestations from Trusted Publishing)
+    provenances = {}
     for f in release.files:
         prov = client.provenance(project.name, target_version, f.filename)
-        if not prov:
-            continue
-        for bundle in prov.get("attestation_bundles", []):
-            pub = bundle.get("publisher") or {}
-            repo = pub.get("repository") or pub.get("project") or "unknown"
-            publishers.add(f"{pub.get('kind', 'publisher')}:{repo}")
-    if publishers:
-        add(Finding("provenance", INFO, f"Attested by trusted publisher {', '.join(sorted(publishers))}."))
-    else:
+        if prov:
+            provenances[f.filename] = prov
+
+    source_repos = _source_repos(project.project_urls)
+    publishers: set[str] = set()
+
+    if provenances and verify and verify_mod.AVAILABLE and detail:
+        state: dict = {}
+        results = []
+        for fname, prov in provenances.items():
+            results += verify_mod.verify_provenance(fname, detail.digests.get(fname, ""), prov, state)
+        failures = [r for r in results if not r.ok]
+        publishers = {r.publisher for r in results if r.ok}
+        if failures:
+            first = failures[0]
+            add(Finding("provenance", policy.attestation_invalid_action,
+                        f"Attestation FAILED verification for {first.filename}: {first.error}"))
+        else:
+            root = " (bundled Sigstore trust root)" if state.get("offline") else ""
+            add(Finding("provenance", INFO,
+                        f"Signatures verified{root}: built by {', '.join(sorted(publishers))}."))
+    elif provenances:
+        for prov in provenances.values():
+            for bundle in prov.get("attestation_bundles", []):
+                publishers.add(verify_mod.describe_publisher(bundle.get("publisher") or {}))
+        why = "verification disabled" if not verify else "install depgate[verify] to check signatures"
+        add(Finding("provenance", INFO,
+                    f"Attested by {', '.join(sorted(publishers))} (not cryptographically verified: {why})."))
+
+    # 9. Publisher must match the repository the project claims as its source
+    gh_publishers = {p.split(":", 1)[1].lower() for p in publishers if p.lower().startswith("github:")}
+    if gh_publishers and source_repos and not (gh_publishers & source_repos):
+        built, claimed = ", ".join(sorted(gh_publishers)), ", ".join(sorted(source_repos))
+        same_owner = {p.split("/")[0] for p in gh_publishers} & {s.split("/")[0] for s in source_repos}
+        if same_owner:
+            # e.g. numpy builds releases from numpy/numpy-release; same org, separate repo.
+            add(Finding("publisher-mismatch", INFO,
+                        f"Built by {built}, a different repo in the same organization as {claimed}."))
+        else:
+            add(Finding("publisher-mismatch", policy.publisher_mismatch_action,
+                        f"Built by {built}, but project metadata points to {claimed} (different owner)."))
+
+    if not provenances:
         established = (
             age is not None
             and age >= policy.established_age_days
@@ -202,7 +274,7 @@ def evaluate(
         add(Finding("provenance", level,
                     "No PyPI attestations; cannot verify which source repo and CI built this release." + note))
 
-    # 8. Source link
+    # 10. Source link
     urls = {k.lower(): v for k, v in project.project_urls.items()}
     if not any(k in urls for k in ("source", "source code", "repository", "homepage", "github", "code")):
         level = policy.no_source_url_action
