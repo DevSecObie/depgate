@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "depgate"
+version = "0.1.0"
+description = "Dependency admission gate: decide whether a proposed package should be allowed, flagged, or blocked."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.scripts]
+depgate = "depgate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,27 @@
+# depgate policy overrides. Pass with: depgate --policy depgate.toml
+# Each table overrides one profile. Omitted keys keep built-in values.
+# Actions are "info", "flag", or "block".
+
+[default]
+project_age_flag_days = 90
+release_age_flag_days = 3
+min_releases = 3
+typo_max_distance = 1
+typo_action = "flag"
+sdist_only_action = "flag"
+no_provenance_action = "info"
+no_source_url_action = "info"
+# popular_file = "top-pypi-packages.txt"
+
+[agent]
+project_age_flag_days = 180
+project_age_block_days = 30
+release_age_flag_days = 7
+min_releases = 5
+typo_max_distance = 2
+typo_action = "block"
+sdist_only_action = "flag"
+no_provenance_action = "flag"
+no_source_url_action = "flag"
+established_age_days = 730
+established_min_releases = 10
