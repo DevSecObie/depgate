@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Callable
 
 PYPI = "https://pypi.org"
-USER_AGENT = "depgate/0.1 (+dependency admission gate)"
+USER_AGENT = "depgate/0.3 (+dependency admission gate)"
 
 # A fetcher takes a URL and returns (status_code, parsed_json_or_None).
 Fetcher = Callable[[str], "tuple[int, dict | None]"]

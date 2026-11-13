@@ -14,6 +14,11 @@ attestation_invalid_action = "block"
 publisher_mismatch_action = "flag"
 vuln_action = "flag"
 no_source_url_action = "info"
+identity_change_action = "flag"
+identity_repo_replaced_action = "block"
+attestation_dropped_action = "flag"
+identity_history = 5
+identity_lookback = 10
 # popular_file = "top-pypi-packages.txt"
 
 [agent]
@@ -31,3 +36,6 @@ vuln_action = "block"
 no_source_url_action = "flag"
 established_age_days = 730
 established_min_releases = 10
+identity_change_action = "flag"
+identity_repo_replaced_action = "block"
+attestation_dropped_action = "flag"

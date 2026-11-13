@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "depgate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Dependency admission gate: decide whether a proposed package should be allowed, flagged, or blocked."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "Proprietary" }
 dependencies = []
 
 [project.optional-dependencies]
-verify = ["pypi-attestations>=0.0.31"]
+verify = ["pypi-attestations>=0.0.31", "sigstore>=3.6"]
 
 [project.scripts]
 depgate = "depgate.cli:main"

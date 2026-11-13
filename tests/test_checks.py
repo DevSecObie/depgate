@@ -248,6 +248,14 @@ class TestInstallCommandParsing(unittest.TestCase):
     def test_option_values_are_not_packages(self):
         self.assertEqual(self.specs("pip install --target /tmp/x -c constraints.txt six"), ["six"])
 
+    def test_npm_installers(self):
+        specs = self.specs("npm i -D @scope/pkg@1.2.3 left-pad && pnpm add --filter web zod; yarn add react@^18")
+        self.assertEqual(specs, ["npm:@scope/pkg@1.2.3", "npm:left-pad", "npm:zod", "npm:react@^18"])
+        self.assertEqual(parse_install_command("npm install"), [])  # lockfile install: nothing named
+        t = parse_install_command("npm install user/repo ./local.tgz --registry https://r.example")
+        self.assertEqual([x.direct_source for x in t[:2]], ["user/repo", "./local.tgz"])
+        self.assertEqual(t[2].custom_index, "https://r.example")
+
     def test_hook_event_reading(self):
         self.assertEqual(read_hook_command('{"tool_name":"Bash","tool_input":{"command":"pip install x"}}'),
                          "pip install x")
