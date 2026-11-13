@@ -44,16 +44,33 @@ def pin_entry(identity: dict) -> dict:
     return {k: identity[k] for k in KEPT if identity.get(k)}
 
 
-def update(path: str, decisions) -> list[str]:
-    """Add or replace pins for every decision that has a build identity. Returns pinned names."""
+IDENTITY_CHECKS = {"provenance", "build-identity", "identity-pin", "attestation-dropped"}
+
+
+def pinnable(d) -> bool:
+    """Only pin a verified identity with no identity or provenance concerns."""
+    if not d.identity or d.verdict == "block":
+        return False
+    if any(f.check in IDENTITY_CHECKS and f.level != "info" for f in d.findings):
+        return False
+    return not any("unverified attestation" in f.message for f in d.findings)
+
+
+def update(path: str, decisions) -> tuple[list[str], list[str]]:
+    """Add or replace pins for decisions whose identity is clean. Returns (pinned, skipped)."""
     pins = load(path)
-    done = []
+    done, skipped = [], []
     for d in decisions:
-        if d.identity:
+        if not d.identity:
+            continue
+        label = f"{d.package}=={d.version}"
+        if pinnable(d):
             pins[normalize(d.package)] = [pin_entry(d.identity)]
-            done.append(f"{d.package}=={d.version}")
+            done.append(label)
+        else:
+            skipped.append(label)
     Path(path).write_text(json.dumps({"version": 1, "packages": dict(sorted(pins.items()))}, indent=2) + "\n")
-    return done
+    return done, skipped
 
 
 def _toml_str(v: str) -> str:

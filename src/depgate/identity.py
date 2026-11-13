@@ -319,13 +319,18 @@ def release_line(version: str) -> str:
     return ".".join(nums[:2])
 
 
+DROP_STREAK = 3   # unsigned releases in a row before "stopped signing" is assumed
+DROP_LOOKBACK = DROP_STREAK + 3
+
+
 def dropped(version: str, earlier: list[tuple[str, BuildIdentity | None]]) -> tuple[str, str] | None:
     """Judge a release that has no attestation. `earlier` is newest first, signed or not.
 
-    Returns (level, message), or None when the package never signed anything.
-    Only the first unsigned release after signed ones is flagged. A release
-    line that was never signed (e.g. a maintenance branch built another way)
-    and a project that already stopped signing are reported as info.
+    Returns (level, message), or None when nothing earlier was signed.
+    Unsigned releases right after signed ones are flagged until DROP_STREAK of
+    them in a row; after that the project is taken to have stopped signing
+    (info). A release line that was never signed (e.g. a maintenance branch
+    built another way) is info too.
     """
     signed = [(v, i) for v, i in earlier if i]
     if not signed:
@@ -335,14 +340,16 @@ def dropped(version: str, earlier: list[tuple[str, BuildIdentity | None]]) -> tu
     if same_line and not any(i for _, i in same_line):
         return "info", (f"No attestation; the {line}.x line has never been signed here "
                         f"(other lines are, e.g. {signed[0][0]}).")
-    previous = same_line[0] if same_line else earlier[0]
-    if previous[1] is None:
-        last = next((v for v, i in (same_line or earlier) if i), signed[0][0])
-        return "info", f"No attestation; the project stopped signing after {last}."
+    scope = same_line or earlier
+    streak = next((n for n, (_, i) in enumerate(scope) if i), len(scope))
+    last_signed = next(v for v, i in scope if i) if any(i for _, i in scope) else signed[0][0]
+    if streak >= DROP_STREAK:
+        return "info", f"No attestation; the project stopped signing after {last_signed}."
     versions = ", ".join(v for v, _ in signed[:5])
+    unsigned_since = f" {streak} unsigned release(s) since {last_signed}." if streak else ""
     return "flag", (f"This release has no attestation, but earlier releases were signed by "
                     f"{summarize(signed[0][1])} ({versions}). It was published outside the usual "
-                    "signed pipeline, for example with a leftover API token or a hijacked account.")
+                    f"signed pipeline, for example with a leftover API token or a hijacked account.{unsigned_since}")
 
 
 def fetch_parallel(fn, items, workers: int = 8) -> list:

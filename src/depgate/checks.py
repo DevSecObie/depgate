@@ -185,7 +185,6 @@ def evaluate(
             ))
 
         # 3. Project age
-        age = _age_days(project.first_upload, now)
         if age is not None:
             if policy.project_age_block_days and age < policy.project_age_block_days:
                 add(Finding("project-age", BLOCK,
@@ -298,7 +297,9 @@ def evaluate(
                     "No PyPI attestations; cannot verify which source repo and CI built this release." + note))
         # Earlier releases were signed but this one isn't: published outside the usual pipeline,
         # e.g. with a leftover API token (Ultralytics 8.3.45/8.3.46, December 2024).
-        judged = identity_mod.dropped(target_version, _earlier(project, release, client, policy))
+        # A few predecessors are enough to judge a drop; don't scan deep history for never-signed packages.
+        judged = identity_mod.dropped(target_version, _earlier(project, release, client, policy,
+                                                               limit=identity_mod.DROP_LOOKBACK))
         if judged:
             level, msg = judged
             add(Finding("attestation-dropped", policy.attestation_dropped_action if level == "flag" else INFO, msg))
@@ -330,7 +331,7 @@ def _history(project: Project, release: Release, client: PyPIClient, policy: Pol
     return [h for h in _earlier(project, release, client, policy) if h[1]][: policy.identity_history]
 
 
-def _earlier(project: Project, release: Release, client: PyPIClient, policy: Policy):
+def _earlier(project: Project, release: Release, client: PyPIClient, policy: Policy, limit: int | None = None):
     """[(version, identity or None)] for the newest earlier releases, newest first. Fetched in parallel."""
     if not release.upload_time:
         return []
@@ -338,7 +339,7 @@ def _earlier(project: Project, release: Release, client: PyPIClient, policy: Pol
         (r for r in project.releases.values()
          if r.files and r.upload_time and r.upload_time < release.upload_time and not r.yanked),
         key=lambda r: r.upload_time, reverse=True,
-    )[: policy.identity_lookback]
+    )[: limit or policy.identity_lookback]
 
     def one(r: Release):
         prov = client.provenance(project.name, r.version, _pick_file(r).filename)
@@ -397,12 +398,12 @@ def _check_identity(decision, project, release, provenances, verified_files, cli
     current: list[identity_mod.BuildIdentity] = []
     seen_publishers = []
     for fname, prov in provenances.items():
+        if verified_files is not None and fname not in verified_files:
+            continue  # a failed signature is already reported; don't trust its certificate or publisher
         for bundle in prov.get("attestation_bundles") or []:
             pub = {k: v for k, v in (bundle.get("publisher") or {}).items() if v is not None}
             if pub and pub not in seen_publishers:
                 seen_publishers.append(pub)
-        if verified_files is not None and fname not in verified_files:
-            continue  # a failed signature is already reported; don't trust its certificate
         current += identity_mod.from_provenance(prov)
     decision.attestation_identities = seen_publishers
     if not current:
@@ -432,12 +433,18 @@ def evaluate_npm(
     if pkg is None:
         add(Finding("exists", BLOCK, f"'{name}' does not exist on npm."))
         return decision
-    target = version or pkg.latest
+    target, note = npm_mod.resolve(pkg, version)
+    if target is None:
+        # Can't tell which version npm would install: say so rather than check the wrong one.
+        add(Finding("version", FLAG if "cannot resolve" in note else BLOCK, f"{note[0].upper()}{note[1:]}."))
+        return decision
     decision.version = target
     info = pkg.versions.get(target)
     if info is None:
         add(Finding("version", BLOCK, f"Version {target} is not published on npm."))
         return decision
+    if note:
+        add(Finding("version", INFO, f"Checking {target}{note}."))
 
     earlier = sorted(
         (v for v in pkg.versions.values() if v.published and info.published and v.published < info.published),

@@ -61,15 +61,84 @@ def encode_name(name: str) -> str:
 
 
 def parse_spec(spec: str) -> tuple[str, str | None]:
-    """'@scope/pkg@1.2.3' -> ('@scope/pkg', '1.2.3'). Ranges and tags count as 'latest'."""
-    at = spec.rfind("@")
+    """'@scope/pkg@1.2.3' -> ('@scope/pkg', '1.2.3'); '@scope/pkg@^1.2' -> ('@scope/pkg', '^1.2').
+
+    The part after the name is returned as written; resolve() turns ranges and
+    dist-tags into the version npm would install.
+    """
+    at = spec.find("@", 1)
     if at > 0:
-        name, ver = spec[:at], spec[at + 1:]
-    else:
-        name, ver = spec, None
-    if ver and not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", ver):
-        ver = None  # ^1.2, ~1, latest, next ... -> resolve to the latest version
-    return name, ver
+        return spec[:at], spec[at + 1:] or None
+    return spec, None
+
+
+_SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
+
+
+def _key(version: str):
+    m = _SEMVER.match(version)
+    if not m:
+        return None
+    major, minor, patch, pre = m.groups()
+    return (int(major), int(minor), int(patch), 0 if pre else 1, pre or "")
+
+
+def _satisfies(version: str, rng: str) -> bool | None:
+    """Simple npm ranges: exact, ^, ~, x-ranges / partials, >=, *. None when unsupported."""
+    k = _key(version)
+    if k is None:
+        return False
+    if k[3] == 0 and not re.search(r"-", rng):
+        return False  # npm skips prereleases unless the range names one
+    rng = rng.strip().lstrip("=v").strip()
+    if rng in ("", "*", "x", "X"):
+        return True
+    if rng.startswith(">="):
+        lo = _key(rng[2:].strip().lstrip("v"))
+        return None if lo is None else k >= lo
+    op = rng[0] if rng[0] in "^~" else ""
+    body = rng[len(op):].lstrip("v")
+    parts = re.split(r"\.", body.split("-")[0])
+    if not parts or not all(re.fullmatch(r"\d+|[xX*]", p) for p in parts) or len(parts) > 3:
+        return None
+    nums = [int(p) for p in parts if p.isdigit()]
+    fixed = len(nums) if all(p.isdigit() for p in parts[:len(nums)]) else 0
+    if op == "" and fixed == 3:
+        return k[:3] == tuple(nums) and (k[3] == 1 or body == version)
+    base = tuple(nums + [0] * (3 - len(nums)))
+    if k[:3] < base:
+        return False
+    if op == "^":
+        # Locks the first non-zero component among those given.
+        lock = next((i for i, n in enumerate(nums) if n != 0), len(nums) - 1) + 1
+        return k[:lock] == base[:lock]
+    if op == "~":
+        return k[:max(1, min(2, fixed))] == base[:max(1, min(2, fixed))]
+    return k[:fixed] == base[:fixed]  # partial / x-range
+
+
+def resolve(pkg: "NpmPackage", wanted: str | None, dist_tags: dict | None = None) -> tuple[str | None, str]:
+    """(version npm would pick, note). Version None with a note when it can't tell."""
+    if not wanted:
+        return pkg.latest, ""
+    if wanted in pkg.versions:
+        return wanted, ""
+    tags = dist_tags if dist_tags is not None else pkg.dist_tags
+    if wanted in tags:
+        return tags[wanted], f" (dist-tag '{wanted}')"
+    matches = []
+    for v in pkg.versions:
+        ok = _satisfies(v, wanted)
+        if ok is None:
+            return None, f"cannot resolve range '{wanted}'"
+        if ok:
+            matches.append(v)
+    if not matches:
+        return None, f"no published version matches '{wanted}'"
+    # npm prefers the latest tag when it satisfies the range.
+    if pkg.latest in matches:
+        return pkg.latest, f" (resolved from '{wanted}')"
+    return max(matches, key=_key), f" (resolved from '{wanted}')"
 
 
 @dataclass
@@ -85,6 +154,7 @@ class NpmPackage:
     name: str
     latest: str
     versions: dict[str, NpmVersion] = field(default_factory=dict)
+    dist_tags: dict[str, str] = field(default_factory=dict)
 
 
 def _time(value: str | None) -> datetime | None:
@@ -114,7 +184,8 @@ class NpmClient:
             dist = meta.get("dist") or {}
             prov = ((dist.get("attestations") or {}).get("provenance") or {}).get("predicateType", "")
             versions[v] = NpmVersion(v, _time(times.get(v)), dist.get("integrity", ""), "slsa.dev/provenance" in prov)
-        return NpmPackage(data.get("name", name), (data.get("dist-tags") or {}).get("latest", ""), versions)
+        tags = data.get("dist-tags") or {}
+        return NpmPackage(data.get("name", name), tags.get("latest", ""), versions, dict(tags))
 
     def provenance_bundle(self, name: str, version: str) -> dict | None:
         """The Sigstore bundle of the SLSA provenance attestation, if any."""
@@ -147,10 +218,13 @@ def bundle_identity(bundle: dict) -> identity_mod.BuildIdentity | None:
 
 
 def integrity_hex(integrity: str) -> str:
-    """'sha512-<base64>' -> hex digest."""
+    """'sha512-<base64>' -> hex digest; '' when missing, not sha512, or malformed."""
     if not integrity.startswith("sha512-"):
         return ""
-    return base64.b64decode(integrity[len("sha512-"):]).hex()
+    try:
+        return base64.b64decode(integrity[len("sha512-"):], validate=True).hex()
+    except ValueError:
+        return ""
 
 
 def verify_bundle(bundle: dict, integrity: str, state: dict) -> str | None:
@@ -171,7 +245,9 @@ def verify_bundle(bundle: dict, integrity: str, state: dict) -> str | None:
     except Exception as e:
         return f"{type(e).__name__}: {str(e)[:200]}"
     want = integrity_hex(integrity)
+    if not want:
+        return "the registry gives no sha512 integrity for this tarball, so the attestation can't be tied to it"
     subjects = json.loads(payload).get("subject") or []
-    if want and not any((s.get("digest") or {}).get("sha512") == want for s in subjects):
+    if not any((s.get("digest") or {}).get("sha512") == want for s in subjects):
         return "attested sha512 does not match the tarball's integrity"
     return None

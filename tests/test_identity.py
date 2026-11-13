@@ -148,11 +148,20 @@ class TestCompare(unittest.TestCase):
         fields = {c.field for c in self.changes(build_config_uri=wf, build_signer_uri=wf)}
         self.assertEqual(fields, {"workflow", "signer"})
 
+    def test_two_unsigned_in_a_row_still_flag(self):
+        S = BASE
+        level, msg = I.dropped("8.3.46", [("8.3.45", None), ("8.3.44", S), ("8.3.43", S)])
+        self.assertEqual(level, "flag")
+        self.assertIn("1 unsigned release(s) since 8.3.44", msg)
+        self.assertEqual(I.dropped("8.3.47", [("8.3.46", None), ("8.3.45", None), ("8.3.44", S)])[0], "flag")
+        self.assertEqual(I.dropped("8.3.48", [("8.3.47", None), ("8.3.46", None), ("8.3.45", None),
+                                              ("8.3.44", S)])[0], "info")
+
     def test_dropped_rules(self):
         S = BASE
         self.assertIsNone(I.dropped("1.3", [("1.2", None), ("1.1", None)]))  # never signed
         self.assertEqual(I.dropped("1.3", [("1.2", S), ("1.1", S)])[0], "flag")  # first drop
-        level, msg = I.dropped("1.4", [("1.3", None), ("1.2", S)])  # already stopped
+        level, msg = I.dropped("1.6", [("1.5", None), ("1.4", None), ("1.3", None), ("1.2", S)])  # stopped
         self.assertEqual(level, "info")
         self.assertIn("stopped signing after 1.2", msg)
         level, msg = I.dropped("2.0.54", [("2.1.7", S), ("2.0.53", None), ("2.1.6", S)])  # unsigned line
@@ -247,13 +256,27 @@ class TestEvaluate(unittest.TestCase):
         legit = check("3.6.0")
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "pins.json")
-            self.assertEqual(pins_mod.update(path, [legit]), ["rhtypes==3.6.0"])
+            self.assertEqual(pins_mod.update(path, [legit]), (["rhtypes==3.6.0"], []))
+            # A flagged identity is never pinned.
+            self.assertEqual(pins_mod.update(path, [check("3.6.1")]), ([], ["rhtypes==3.6.1"]))
             saved = json.loads(Path(path).read_text())["packages"]["rhtypes"][0]
             self.assertNotIn("run_invocation_uri", saved)  # per-run fields aren't pinned
             pins = pins_mod.load(path)
         d = check("3.6.1", pins=pins)
         self.assertIn("oidc-61fff775", by_check(d, "identity-pin")[0].message)
         self.assertEqual(by_check(check("3.6.0", pins=pins), "identity-pin")[0].level, INFO)
+
+    def test_failed_signature_publisher_is_not_emitted(self):
+        import test_checks
+        test_checks.TAMPERED.add("rhtypes-3.6.0.whl")
+        try:
+            d = check("3.6.0")
+        finally:
+            test_checks.TAMPERED.clear()
+        self.assertEqual(d.verdict, BLOCK)
+        self.assertEqual(d.attestation_identities, [])
+        self.assertIsNone(d.identity)
+        self.assertEqual(pins_mod.pep751([d]), "")
 
     def test_pep751_output(self):
         out = pins_mod.pep751([check("3.6.0")])
@@ -305,12 +328,30 @@ class TestNpm(unittest.TestCase):
     def test_spec_parsing(self):
         self.assertEqual(npm_mod.parse_spec("@scope/pkg@1.2.3"), ("@scope/pkg", "1.2.3"))
         self.assertEqual(npm_mod.parse_spec("@scope/pkg"), ("@scope/pkg", None))
-        self.assertEqual(npm_mod.parse_spec("left-pad@^1.3.0"), ("left-pad", None))
+        self.assertEqual(npm_mod.parse_spec("left-pad@^1.3.0"), ("left-pad", "^1.3.0"))
         self.assertEqual(npm_mod.encode_name("@scope/pkg"), "@scope%2Fpkg")
 
     def test_integrity_hex(self):
         self.assertEqual(npm_mod.integrity_hex("sha512-" + base64.b64encode(b"\x01\x02").decode()), "0102")
         self.assertEqual(npm_mod.integrity_hex("sha1-abc"), "")
+        self.assertEqual(npm_mod.integrity_hex("sha512-not*base64"), "")  # malformed: no crash
+
+    def test_range_resolution(self):
+        vs = ["1.2.0", "1.4.8", "1.4.9", "1.5.0-beta.1", "2.0.0", "3.0.0"]
+        pkg = npm_mod.NpmPackage("foo", "3.0.0",
+                                 {v: npm_mod.NpmVersion(v, None, "", True) for v in vs}, {"latest": "3.0.0", "next": "1.5.0-beta.1"})
+        r = lambda w: npm_mod.resolve(pkg, w)[0]
+        self.assertEqual(r("^1.4.0"), "1.4.9")      # not latest
+        self.assertEqual(r("~1.4"), "1.4.9")
+        self.assertEqual(r("1.x"), "1.4.9")
+        self.assertEqual(r("1"), "1.4.9")
+        self.assertEqual(r(">=2.0.0"), "3.0.0")     # latest satisfies, npm prefers it
+        self.assertEqual(r("next"), "1.5.0-beta.1")  # dist-tag
+        self.assertEqual(r("2.0.0"), "2.0.0")
+        self.assertEqual(r(None), "3.0.0")
+        self.assertIsNone(r("^9.0.0"))
+        self.assertIsNone(r("1.2.0 - 1.4.0"))       # unsupported: don't guess
+        self.assertIn("cannot resolve", npm_mod.resolve(pkg, "<2 || >2.5")[1])
 
     def test_redhat_end_to_end(self):
         versions = ["3.4.2", "3.5.0", "3.5.1", "3.5.2", "3.6.0"]
@@ -343,6 +384,16 @@ class TestNpm(unittest.TestCase):
         d = npm_check(FakeNpm("axios", rows), "axios", "1.13.5")
         fields = {f.message.split(":")[0] for f in by_check(d, "build-identity") if f.level == FLAG}
         self.assertTrue(fields)
+
+    def test_range_checks_the_version_npm_would_install(self):
+        rows = [("3.4.2", "2026-03-10T10:00:00Z", REDHAT / "3.4.2.cert.b64"),
+                ("3.5.0", "2026-03-11T10:00:00Z", REDHAT / "3.5.0.cert.b64"),
+                ("3.6.1", "2026-06-01T09:00:00Z", REDHAT / "3.6.1-malicious.cert.b64"),
+                ("4.0.0", "2026-07-01T09:00:00Z", REDHAT / "3.5.0.cert.b64")]
+        fake = FakeNpm("t", rows)
+        d = npm_check(fake, "t", "^3.5.0")
+        self.assertEqual(d.version, "3.6.1")
+        self.assertEqual(d.verdict, FLAG)
 
     def test_missing_package_blocks(self):
         self.assertEqual(npm_check(FakeNpm("x", [("1.0.0", "2026-01-01T00:00:00Z", None)]), "nope", None).verdict, BLOCK)

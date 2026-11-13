@@ -9,7 +9,8 @@ Two checks are measured here:
   earlier signed releases (ref, trigger, workflow, signer, runner, environment,
   repository and owner IDs).
 - **attestation-dropped**: an unsigned release after signed ones in the same
-  release line.
+  release line (up to 3 unsigned in a row; after that the project is taken to
+  have stopped signing).
 
 ## Real incidents (real signing certificates, in `tests/fixtures/incidents/`)
 
@@ -35,12 +36,12 @@ release with signed history is compared with up to 5 signed releases before it.
 |---|---|
 | Packages with attestations | 108 of 200 |
 | Releases compared | 947 |
-| Releases flagged | 23 (2.43%), in 19 packages |
+| Releases flagged | 29 (3.06%), in 19 packages |
 | ...by build-identity | 17 |
-| ...by attestation-dropped | 6 |
+| ...by attestation-dropped | 12 |
 | Releases blocked | 0 |
 
-All 23 looked legitimate on inspection:
+All 29 looked legitimate on inspection:
 
 - Release-process changes: pluggy moved to `deploy.yml`; matplotlib and
   scikit-learn moved builds to separate `*-release` repos.
@@ -49,8 +50,8 @@ All 23 looked legitimate on inspection:
   sqlalchemy; hf-xet dev releases from personal branches.
 - Switching between tag and branch releases: oauthlib, threadpoolctl.
 - Projects that stopped signing: annotated-doc, httpx2, httpcore2, watchfiles,
-  sse-starlette, google-cloud-bigquery. Only their first unsigned release is
-  flagged.
+  sse-starlette, google-cloud-bigquery. Their first three unsigned releases
+  are flagged; later ones are info.
 
 These are the changes a person should glance at, which is why both checks
 default to "flag" (ask), not "block".
@@ -59,10 +60,12 @@ Tuning that got here:
 
 - Treating version numbers in branch names as a pattern (`release-9.2.0` ≈
   `release-9.1.1`) cut a 30-package trial from 10.2% to 2.2%.
-- Flagging only the first unsigned release, within its release line, cut
-  attestation-dropped from 29 flags to 6. The other 23 were projects that had
-  already stopped signing, or a maintenance line (SQLAlchemy 2.0.x) that was
-  never signed while 2.1.x is.
+- Judging drops within the release line, and treating a long unsigned run as
+  "stopped signing", cut attestation-dropped from 29 flags to 6 when only the
+  first unsigned release was flagged. Code review then showed an attacker could
+  publish a harmless unsigned release first and the malicious one second, so
+  up to 3 unsigned releases in a row are flagged now: 12 flags. That trade
+  costs 0.6 points of flag rate.
 
 npm has no public top-packages list, so it has no false-positive measurement yet.
 
@@ -72,8 +75,8 @@ npm has no public top-packages list, so it has no false-positive measurement yet
   dependency of the build) keep the normal identity and the real commit. Not caught.
 - Someone who can push a branch matching the project's release-branch pattern,
   or a tag, can blend in. The ref is still shown in the output.
-- An attacker who publishes two unsigned releases gets the first flagged; the
-  second is reported as info ("stopped signing").
+- An attacker who first publishes 3 or more unsigned releases gets the later
+  ones reported as info ("stopped signing").
 - A package with one earlier signed release has a thin baseline; one legitimate
   oddity there produces a flag (packaging 26.0rc2).
 - Earlier releases' identities come from the registry's stored attestations (PyPI

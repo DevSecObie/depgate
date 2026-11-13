@@ -42,7 +42,19 @@ NPM_INSTALLERS = [
     ("pnpm", "add"), ("pnpm", "install"), ("pnpm", "i"),
     ("yarn", "add"), ("bun", "add"), ("bun", "install"), ("bun", "i"),
 ]
-NPM_OPTS_WITH_VALUE = {"--prefix", "-w", "--workspace", "--tag", "--filter", "-C", "--dir", "--cwd"}
+# Options that take a value, per tool. pnpm's and yarn's -w (workspace root) takes none.
+NPM_OPTS_WITH_VALUE = {
+    "npm": {"--prefix", "-w", "--workspace", "--tag", "--userconfig", "--globalconfig"},
+    "pnpm": {"--filter", "-F", "-C", "--dir", "--userconfig"},
+    "yarn": {"--cwd"},
+    "bun": {"--cwd", "--config", "-c"},
+}
+# Settings that send installs to another registry or index.
+REGISTRY_OPTS = {"--registry", "--userconfig", "--globalconfig", "--config", "-c"}
+REGISTRY_ENV = re.compile(r"^(npm_config_registry|npm_config_userconfig|npm_config_globalconfig|"
+                          r"yarn_npm_registry_server|bun_config_registry|pip_index_url|pip_extra_index_url|"
+                          r"uv_index_url|uv_extra_index_url|uv_index|uv_default_index|pip_find_links|"
+                          r"poetry_repositories_.*)$", re.I)
 
 # pip/uv options that consume the next token.
 OPTS_WITH_VALUE = {
@@ -62,7 +74,8 @@ class Target:
     direct_source: str | None = None # URL, VCS, or local path install
 
 
-def _split_commands(command: str) -> list[list[str]]:
+def _split_commands(command: str) -> list[tuple[list[str], list[str]]]:
+    """[(env_assignments, tokens)] for each simple command."""
     out = []
     for part in SEPARATORS.split(command):
         part = part.strip()
@@ -72,39 +85,60 @@ def _split_commands(command: str) -> list[list[str]]:
             tokens = shlex.split(part)
         except ValueError:
             tokens = part.split()
-        # Drop leading env assignments and sudo.
-        while tokens and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]) or tokens[0] == "sudo"):
+        # Peel off leading env assignments (kept: they can redirect the registry) and sudo.
+        env = []
+        while tokens and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]) or tokens[0] in ("sudo", "env")):
+            if tokens[0] not in ("sudo", "env"):
+                env.append(tokens[0])
             tokens = tokens[1:]
         if tokens:
             tokens[0] = tokens[0].rsplit("/", 1)[-1]  # /usr/bin/pip3 -> pip3
             m = re.fullmatch(r"(python3?|pip3?)(\.\d+)?", tokens[0])
             if m:
                 tokens[0] = m.group(1)  # python3.12 -> python3, pip3.12 -> pip3
-            out.append(tokens)
+            out.append((env, tokens))
     return out
 
 
-def _npm_targets(args: list[str]) -> list[Target]:
+def _npm_is_registry_spec(spec: str) -> bool:
+    """True for 'name' or 'name@<version|range|tag>'; False for URLs, paths, aliases, git and file specs."""
+    if "://" in spec or spec.startswith(("git+", "git:", "github:", "gitlab:", "bitbucket:", "gist:", "file:",
+                                         "link:", "npm:", "workspace:", "portal:", "patch:", ".", "/", "~")):
+        return False
+    if spec.endswith((".tgz", ".tar.gz")):
+        return False
+    at = spec.find("@", 1)  # skip a leading @scope
+    name, ver = (spec[:at], spec[at + 1:]) if at > 0 else (spec, "")
+    if name.count("/") > (1 if name.startswith("@") else 0):
+        return False
+    if "/" in name and not name.startswith("@"):
+        return False  # user/repo shorthand for GitHub
+    if ver and (":" in ver or "/" in ver):
+        return False  # alias (npm:x), git/github/file spec written after a name
+    return True
+
+
+def _npm_targets(tool: str, args: list[str]) -> list[Target]:
     targets: list[Target] = []
+    with_value = NPM_OPTS_WITH_VALUE.get(tool, set())
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--registry" and i + 1 < len(args):
-            targets.append(Target(custom_index=args[i + 1]))
+        opt = a.split("=", 1)[0]
+        if opt in REGISTRY_OPTS and (opt in with_value or opt == "--registry" or "=" in a):
+            value = a.split("=", 1)[1] if "=" in a else (args[i + 1] if i + 1 < len(args) else "")
+            targets.append(Target(custom_index=f"{opt} {value}".strip()))
+            i += 1 if "=" in a else 2
+            continue
+        if a in with_value:
             i += 2
             continue
-        if a.startswith("--registry="):
-            targets.append(Target(custom_index=a.split("=", 1)[1]))
-        elif a in NPM_OPTS_WITH_VALUE:
-            i += 2
-            continue
-        elif a.startswith("-"):
+        if a.startswith("-"):
             pass
-        elif ("://" in a or a.startswith(("git+", "git:", "github:", "file:", "link:", "npm:", ".", "/", "~"))
-              or a.endswith((".tgz", ".tar.gz")) or ("/" in a and not a.startswith("@"))):
-            targets.append(Target(direct_source=a))  # URL, path, alias or user/repo shorthand
-        else:
+        elif _npm_is_registry_spec(a):
             targets.append(Target(spec="npm:" + a))
+        else:
+            targets.append(Target(direct_source=a))  # URL, path, alias, git or user/repo shorthand
         i += 1
     return targets
 
@@ -116,22 +150,25 @@ def parse_install_command(command: str) -> list[Target]:
     packages, so there is nothing to check here.
     """
     targets: list[Target] = []
-    for tokens in _split_commands(command):
+    for env, tokens in _split_commands(command):
         npm_args = None
         for prefix in NPM_INSTALLERS:
             if [t.lower() for t in tokens[:len(prefix)]] == list(prefix):
                 npm_args = tokens[len(prefix):]
                 break
-        if npm_args is not None:
-            targets += _npm_targets(npm_args)
-            continue
         args = None
-        for prefix in INSTALLERS:
-            n = len(prefix)
-            if [t.lower() for t in tokens[:n]] == list(prefix):
-                args = tokens[n:]
-                break
-        if args is None:
+        if npm_args is None:
+            for prefix in INSTALLERS:
+                if [t.lower() for t in tokens[:len(prefix)]] == list(prefix):
+                    args = tokens[len(prefix):]
+                    break
+        if npm_args is None and args is None:
+            continue
+        for assignment in env:
+            if REGISTRY_ENV.match(assignment.split("=", 1)[0]):
+                targets.append(Target(custom_index=assignment))
+        if npm_args is not None:
+            targets += _npm_targets(tokens[0].lower(), npm_args)
             continue
         i = 0
         while i < len(args):

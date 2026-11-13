@@ -84,7 +84,7 @@ def decide_targets(targets: list[Target], client, policy, profile, verify,
                                      "depgate only vets PyPI and registry.npmjs.org.", profile))
         elif t.direct_source:
             out.append(_non_registry(t.direct_source, FLAG,
-                                     "Installs from a URL, VCS repo, or local path, bypassing registry checks.", profile))
+                                     "Installs from a URL, VCS repo, local path or package alias, bypassing registry checks.", profile))
     return out
 
 
@@ -159,9 +159,12 @@ def main(argv: list[str] | None = None) -> int:
     decisions = decide_targets(targets, PyPIClient(), policy, profile, verify, args.identity_only, pins)
 
     if args.update_pins:
-        done = pins_mod.update(args.pins, decisions)
+        done, skipped = pins_mod.update(args.pins, decisions)
         print(f"Pinned {len(done)} build identit{'y' if len(done) == 1 else 'ies'} in {args.pins}: {', '.join(done) or 'none'}",
               file=sys.stderr)
+        if skipped:
+            print(f"Not pinned (identity unverified or has concerns; review first): {', '.join(skipped)}",
+                  file=sys.stderr)
     if args.pep751:
         print(pins_mod.pep751(decisions))
         return max((EXIT[d.verdict] for d in decisions), default=0)
