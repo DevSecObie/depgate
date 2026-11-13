@@ -81,6 +81,8 @@ depgate -r requirements.txt --pins depgate-pins.json --update-pins   # record
 depgate -r requirements.txt --pins depgate-pins.json                 # compare
 ```
 
+`--update-pins` also accepts a flagged identity change after you've reviewed it (re-run it to re-pin). It never pins a blocked release. Pins recorded without signature verification are marked `"verified": false`.
+
 **PEP 751.** `--pep751` prints each package's Trusted Publisher identity as `pylock.toml` `attestation-identities` entries, for installers that enforce them. That record is coarser than a pin (no ref, trigger or repository ID).
 
 ## Gating an AI coding agent (Claude Code hook)

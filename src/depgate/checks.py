@@ -38,6 +38,8 @@ class Decision:
     identity: dict | None = None
     # PyPI Trusted Publisher records, in PEP 751 `attestation-identities` shape.
     attestation_identities: list[dict] = field(default_factory=list)
+    # Whether `identity` came from a cryptographically verified attestation.
+    identity_verified: bool = False
 
     @property
     def verdict(self) -> str:
@@ -300,6 +302,10 @@ def evaluate(
         # A few predecessors are enough to judge a drop; don't scan deep history for never-signed packages.
         judged = identity_mod.dropped(target_version, _earlier(project, release, client, policy,
                                                                limit=identity_mod.DROP_LOOKBACK))
+        if judged and judged[0] == "info":
+            # "Never signed in this line" or "stopped signing" from a short window can hide
+            # signed releases further back (parallel release lines); look again, deeper.
+            judged = identity_mod.dropped(target_version, _earlier(project, release, client, policy))
         if judged:
             level, msg = judged
             add(Finding("attestation-dropped", policy.attestation_dropped_action if level == "flag" else INFO, msg))
@@ -409,6 +415,7 @@ def _check_identity(decision, project, release, provenances, verified_files, cli
     if not current:
         return
     unverified = "" if verified_files is not None else " (read from an unverified attestation)"
+    decision.identity_verified = verified_files is not None
     history = _history(project, release, client, policy)
     identity_findings(decision, current, history, pins, normalize(project.name), policy, unverified)
 
@@ -433,10 +440,10 @@ def evaluate_npm(
     if pkg is None:
         add(Finding("exists", BLOCK, f"'{name}' does not exist on npm."))
         return decision
-    target, note = npm_mod.resolve(pkg, version)
+    target, note, status = npm_mod.resolve(pkg, version)
     if target is None:
         # Can't tell which version npm would install: say so rather than check the wrong one.
-        add(Finding("version", FLAG if "cannot resolve" in note else BLOCK, f"{note[0].upper()}{note[1:]}."))
+        add(Finding("version", FLAG if status == npm_mod.UNSUPPORTED else BLOCK, f"{note[0].upper()}{note[1:]}."))
         return decision
     decision.version = target
     info = pkg.versions.get(target)
@@ -479,6 +486,7 @@ def evaluate_npm(
         root = " (bundled Sigstore trust root)" if state.get("offline") else ""
         add(Finding("provenance", INFO, f"Provenance signature verified{root}; it attests this exact tarball."))
         unverified = ""
+        decision.identity_verified = True
     else:
         why = "verification disabled" if not verify else "install depgate[verify] to check signatures"
         add(Finding("provenance", INFO, f"npm provenance present (not cryptographically verified: {why})."))

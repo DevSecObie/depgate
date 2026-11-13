@@ -157,6 +157,19 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(I.dropped("8.3.48", [("8.3.47", None), ("8.3.46", None), ("8.3.45", None),
                                               ("8.3.44", S)])[0], "info")
 
+    def test_parallel_lines_look_deeper(self):
+        """Signed 2.0.x release beyond the short window must still be found."""
+        proj_releases = {}
+        order = [("2.0.52", True), ("2.1.3", True), ("2.1.4", True), ("2.1.5", True), ("2.1.6", True),
+                 ("2.0.53", False), ("2.1.7", True), ("2.0.54", False)]
+        for n, (v, _) in enumerate(order):
+            proj_releases[v] = [file("pkg", v, 400 - 10 * n)]
+        proj = project("pkg", proj_releases, {"Source": "https://github.com/RedHatInsights/frontend-components"})
+        certs = {f"pkg-{v}.whl": cert_b64(REDHAT / "3.6.0.cert.b64") for v, signed in order if signed}
+        d = evaluate("pkg", "2.0.54", PyPIClient(fetch=CertPyPI(proj, certs)), DEFAULT, "default", now=NOW)
+        [f] = by_check(d, "attestation-dropped")
+        self.assertEqual(f.level, FLAG)
+
     def test_dropped_rules(self):
         S = BASE
         self.assertIsNone(I.dropped("1.3", [("1.2", None), ("1.1", None)]))  # never signed
@@ -257,8 +270,22 @@ class TestEvaluate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "pins.json")
             self.assertEqual(pins_mod.update(path, [legit]), (["rhtypes==3.6.0"], []))
-            # A flagged identity is never pinned.
-            self.assertEqual(pins_mod.update(path, [check("3.6.1")]), ([], ["rhtypes==3.6.1"]))
+            # A blocked release is never pinned...
+            import test_checks
+            test_checks.TAMPERED.add("rhtypes-3.6.1.whl")
+            try:
+                blocked = check("3.6.1")
+            finally:
+                test_checks.TAMPERED.clear()
+            self.assertEqual(blocked.verdict, BLOCK)
+            self.assertEqual(pins_mod.update(path, [blocked]), ([], []))  # failed signature: no identity
+            blocked.identity = {"source_repo_uri": "x"}
+            self.assertEqual(pins_mod.update(path, [blocked]), ([], ["rhtypes==3.6.1"]))
+            # ...but a reviewed, flagged change can be accepted (re-pinned).
+            flagged = check("3.6.1")
+            self.assertEqual(flagged.verdict, FLAG)
+            self.assertEqual(pins_mod.update(path, [flagged]), (["rhtypes==3.6.1"], []))
+            pins_mod.update(path, [legit])
             saved = json.loads(Path(path).read_text())["packages"]["rhtypes"][0]
             self.assertNotIn("run_invocation_uri", saved)  # per-run fields aren't pinned
             pins = pins_mod.load(path)
@@ -351,7 +378,19 @@ class TestNpm(unittest.TestCase):
         self.assertEqual(r(None), "3.0.0")
         self.assertIsNone(r("^9.0.0"))
         self.assertIsNone(r("1.2.0 - 1.4.0"))       # unsupported: don't guess
-        self.assertIn("cannot resolve", npm_mod.resolve(pkg, "<2 || >2.5")[1])
+        self.assertEqual(npm_mod.resolve(pkg, "<2 || >2.5")[2], npm_mod.UNSUPPORTED)
+        self.assertIsNone(r("1.x.3"))               # digits after a wildcard: unsupported
+
+    def test_prerelease_rules(self):
+        vs = ["1.5.0-beta.1", "1.5.0-beta.2", "1.5.0-beta.10", "1.8.0", "1.9.0-rc.1", "2.0.0"]
+        pkg = npm_mod.NpmPackage("foo", "2.0.0", {v: npm_mod.NpmVersion(v, None, "", True) for v in vs},
+                                 {"latest": "2.0.0"})
+        r = lambda w: npm_mod.resolve(pkg, w)[0]
+        self.assertEqual(r("^1.5.0-beta.1"), "1.8.0")          # other tuples' prereleases excluded
+        self.assertEqual(r("~1.5.0-beta.2"), "1.5.0-beta.10")  # numeric identifiers compare as numbers
+        self.assertEqual(r("1.5.0-beta.2"), "1.5.0-beta.2")
+        self.assertEqual(r("^1.0.0"), "1.8.0")                 # no prereleases without asking
+        self.assertFalse(npm_mod._satisfies("1.5.0-beta.1", "^1.5.0-beta.2"))
 
     def test_redhat_end_to_end(self):
         versions = ["3.4.2", "3.5.0", "3.5.1", "3.5.2", "3.6.0"]

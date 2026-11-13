@@ -37,23 +37,19 @@ def load(path: str) -> dict[str, list[dict]]:
     data = json.loads(p.read_text())
     if data.get("version") != 1:
         raise ValueError(f"{path}: unsupported pins file version {data.get('version')!r}")
-    return {normalize(k): v for k, v in (data.get("packages") or {}).items()}
+    return {normalize(k): [{f: x for f, x in e.items() if f in KEPT} for e in v]
+            for k, v in (data.get("packages") or {}).items()}
 
 
 def pin_entry(identity: dict) -> dict:
     return {k: identity[k] for k in KEPT if identity.get(k)}
 
 
-IDENTITY_CHECKS = {"provenance", "build-identity", "identity-pin", "attestation-dropped"}
-
-
 def pinnable(d) -> bool:
-    """Only pin a verified identity with no identity or provenance concerns."""
-    if not d.identity or d.verdict == "block":
-        return False
-    if any(f.check in IDENTITY_CHECKS and f.level != "info" for f in d.findings):
-        return False
-    return not any("unverified attestation" in f.message for f in d.findings)
+    """--update-pins is an explicit "accept this identity", so a flagged identity
+    change can be re-pinned after review. Never pin a blocked release (e.g. a
+    re-created repository or a failed signature)."""
+    return bool(d.identity) and d.verdict != "block"
 
 
 def update(path: str, decisions) -> tuple[list[str], list[str]]:
@@ -65,7 +61,10 @@ def update(path: str, decisions) -> tuple[list[str], list[str]]:
             continue
         label = f"{d.package}=={d.version}"
         if pinnable(d):
-            pins[normalize(d.package)] = [pin_entry(d.identity)]
+            entry = pin_entry(d.identity)
+            if not d.identity_verified:
+                entry["verified"] = False  # recorded without signature verification
+            pins[normalize(d.package)] = [entry]
             done.append(label)
         else:
             skipped.append(label)

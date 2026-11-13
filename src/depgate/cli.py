@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Pinned {len(done)} build identit{'y' if len(done) == 1 else 'ies'} in {args.pins}: {', '.join(done) or 'none'}",
               file=sys.stderr)
         if skipped:
-            print(f"Not pinned (identity unverified or has concerns; review first): {', '.join(skipped)}",
+            print(f"Not pinned (blocked; review first): {', '.join(skipped)}",
                   file=sys.stderr)
     if args.pep751:
         print(pins_mod.pep751(decisions))

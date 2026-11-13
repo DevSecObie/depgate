@@ -72,7 +72,15 @@ def parse_spec(spec: str) -> tuple[str, str | None]:
     return spec, None
 
 
-_SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
+_SEMVER = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
+
+
+def _pre_key(pre: str | None):
+    """SemVer prerelease precedence: a release sorts after its prereleases;
+    numeric identifiers compare as numbers and before alphanumeric ones."""
+    if not pre:
+        return (1,)
+    return (0, tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")))
 
 
 def _key(version: str):
@@ -80,65 +88,86 @@ def _key(version: str):
     if not m:
         return None
     major, minor, patch, pre = m.groups()
-    return (int(major), int(minor), int(patch), 0 if pre else 1, pre or "")
+    return (int(major), int(minor), int(patch), _pre_key(pre))
 
 
 def _satisfies(version: str, rng: str) -> bool | None:
-    """Simple npm ranges: exact, ^, ~, x-ranges / partials, >=, *. None when unsupported."""
+    """Simple npm ranges: exact, ^, ~, x-ranges / partials, >=, *. None when unsupported.
+
+    Prereleases follow npm: a prerelease version matches only if the range
+    names a prerelease on the same major.minor.patch.
+    """
     k = _key(version)
     if k is None:
         return False
-    if k[3] == 0 and not re.search(r"-", rng):
-        return False  # npm skips prereleases unless the range names one
-    rng = rng.strip().lstrip("=v").strip()
+    rng = rng.strip()
+    if rng.startswith("="):
+        rng = rng[1:].strip()
     if rng in ("", "*", "x", "X"):
-        return True
+        return k[3] == (1,)
     if rng.startswith(">="):
-        lo = _key(rng[2:].strip().lstrip("v"))
-        return None if lo is None else k >= lo
+        lo = _key(rng[2:].strip())
+        if lo is None:
+            return None
+        if k[3] != (1,) and k[:3] != lo[:3]:
+            return False
+        return k >= lo
     op = rng[0] if rng[0] in "^~" else ""
-    body = rng[len(op):].lstrip("v")
-    parts = re.split(r"\.", body.split("-")[0])
-    if not parts or not all(re.fullmatch(r"\d+|[xX*]", p) for p in parts) or len(parts) > 3:
+    body = rng[len(op):].strip().lstrip("v")
+    pre = None
+    if "-" in body:
+        body, pre = body.split("-", 1)
+    parts = body.split(".")
+    if not 1 <= len(parts) <= 3 or not all(re.fullmatch(r"\d+|[xX*]", p) for p in parts):
         return None
-    nums = [int(p) for p in parts if p.isdigit()]
-    fixed = len(nums) if all(p.isdigit() for p in parts[:len(nums)]) else 0
-    if op == "" and fixed == 3:
-        return k[:3] == tuple(nums) and (k[3] == 1 or body == version)
-    base = tuple(nums + [0] * (3 - len(nums)))
-    if k[:3] < base:
+    fixed = next((n for n, p in enumerate(parts) if not p.isdigit()), len(parts))
+    if any(p.isdigit() for p in parts[fixed:]):
+        return None  # 1.x.3: digits after a wildcard aren't a valid range
+    nums = [int(p) for p in parts[:fixed]]
+    if pre is not None and fixed < 3:
+        return None
+    base = tuple(nums + [0] * (3 - len(nums))) + (_pre_key(pre),)
+    if k[3] != (1,):  # prerelease version: only with a prerelease range on the same tuple
+        if pre is None or k[:3] != base[:3]:
+            return False
+    if k < base:
         return False
     if op == "^":
         # Locks the first non-zero component among those given.
-        lock = next((i for i, n in enumerate(nums) if n != 0), len(nums) - 1) + 1
+        lock = next((n for n, v in enumerate(nums) if v != 0), max(len(nums) - 1, 0)) + 1
         return k[:lock] == base[:lock]
     if op == "~":
-        return k[:max(1, min(2, fixed))] == base[:max(1, min(2, fixed))]
-    return k[:fixed] == base[:fixed]  # partial / x-range
+        lock = max(1, min(2, fixed))
+        return k[:lock] == base[:lock]
+    if fixed == 3:
+        return k == base
+    return k[:fixed] == base[:fixed]
 
 
-def resolve(pkg: "NpmPackage", wanted: str | None, dist_tags: dict | None = None) -> tuple[str | None, str]:
-    """(version npm would pick, note). Version None with a note when it can't tell."""
+RESOLVED, UNSUPPORTED, NO_MATCH = "resolved", "unsupported", "no-match"
+
+
+def resolve(pkg: "NpmPackage", wanted: str | None) -> tuple[str | None, str, str]:
+    """(version npm would pick or None, note, status)."""
     if not wanted:
-        return pkg.latest, ""
+        return pkg.latest, "", RESOLVED
     if wanted in pkg.versions:
-        return wanted, ""
-    tags = dist_tags if dist_tags is not None else pkg.dist_tags
-    if wanted in tags:
-        return tags[wanted], f" (dist-tag '{wanted}')"
+        return wanted, "", RESOLVED
+    if wanted in pkg.dist_tags:
+        return pkg.dist_tags[wanted], f" (dist-tag '{wanted}')", RESOLVED
     matches = []
     for v in pkg.versions:
         ok = _satisfies(v, wanted)
         if ok is None:
-            return None, f"cannot resolve range '{wanted}'"
+            return None, f"cannot resolve range '{wanted}'", UNSUPPORTED
         if ok:
             matches.append(v)
     if not matches:
-        return None, f"no published version matches '{wanted}'"
+        return None, f"no published version matches '{wanted}'", NO_MATCH
     # npm prefers the latest tag when it satisfies the range.
     if pkg.latest in matches:
-        return pkg.latest, f" (resolved from '{wanted}')"
-    return max(matches, key=_key), f" (resolved from '{wanted}')"
+        return pkg.latest, f" (resolved from '{wanted}')", RESOLVED
+    return max(matches, key=_key), f" (resolved from '{wanted}')", RESOLVED
 
 
 @dataclass
